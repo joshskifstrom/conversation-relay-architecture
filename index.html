@@ -1,0 +1,95 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Customer Bot Flow: ConversationRelay Architecture</title>
+<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:1200px;margin:40px auto;padding:0 24px;color:#121c2d}
+h1{color:#f22f46} section{margin:48px 0;padding:24px;border:1px solid #e1e3ea;border-radius:8px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #e1e3ea;padding:8px;text-align:left;vertical-align:top}th{background:#f4f4f6}</style>
+<script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";mermaid.initialize({startOnLoad:true,theme:"default",sequence:{showSequenceNumbers:true}});</script>
+</head><body><h1>Customer Bot Flow: Removing the Daily Hop with ConversationRelay</h1>
+<p>One media leg, one call ID, per-layer latency visibility.</p>
+<section><h2>At a Glance</h2><table><tr><th></th><th>Current (Daily)</th><th>Target (ConversationRelay)</th></tr>
+<tr><td>Media legs per inbound call</td><td>3+</td><td><b>1</b></td></tr>
+<tr><td>Vendors in media path</td><td>Twilio + Daily + Google</td><td>Twilio + Google (LLM only)</td></tr>
+<tr><td>Audio</td><td>Downsampled in Daily room</td><td>HD end to end (carrier-dependent)</td></tr>
+<tr><td>Latency visibility</td><td>One opaque number</td><td>STT / TTS / network / application</td></tr>
+<tr><td>Transcript</td><td>Post-call, built by Bot Flow</td><td>Real-time, system of record</td></tr>
+<tr><td>IDs to correlate when debugging</td><td>CallSid + Daily room + Orkes task + Vertex session</td><td><b>CallSid</b></td></tr></table></section>
+<section><h2>Current State: Production Inbound via Daily</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as Caller (PSTN)
+    participant T as Twilio (Bot Flow Account)
+    participant GW as Bot Flow Gateway
+    participant Q as Orkes Task Queue
+    participant D as Daily (WebRTC Room)
+    participant M as Bot Flow Agent / Library (GKE)
+    participant V as Vertex AI (Gemini Live S2S)
+
+    C-&gt;&gt;T: Inbound call (PSTN leg #1)
+    T-&gt;&gt;GW: Incoming call webhook
+    Note over T: Caller hears ~2 buffered rings
+    GW-&gt;&gt;Q: Drop task (CallSid)
+    Q-&gt;&gt;M: Worker picks up task
+    M-&gt;&gt;D: Create Daily room
+    M-&gt;&gt;T: Connect CallSid to Daily room (SIP/PSTN leg #2)
+    T-&gt;&gt;D: Caller audio bridged into room
+    M-&gt;&gt;D: Bot joins room (WebRTC leg #3)
+    loop Every turn
+        D-&gt;&gt;M: Caller audio (re-encoded, ~8 kHz)
+        M-&gt;&gt;V: Raw audio over WebSocket
+        V-&gt;&gt;M: Audio response
+        M-&gt;&gt;D: Bot audio
+        D-&gt;&gt;T: Mixed audio back to caller
+        T-&gt;&gt;C: Audio
+    end
+    M-&gt;&gt;T: Transfer to human (new outbound leg #4)
+    M-&gt;&gt;M: Post-call eval: transcribe, summarize, redact
+</pre></section>
+<section><h2>Target State: Direct via ConversationRelay</h2><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as Caller (PSTN)
+    participant T as Twilio (Bot Flow Account)
+    participant CR as ConversationRelay&lt;br/&gt;(STT · TTS · Turn Detection)
+    participant M as Bot Flow Agent / Library (GKE)
+    participant V as Vertex AI (Gemini text)
+    participant CI as Orchestrator + Conversation Intelligence
+
+    C-&gt;&gt;T: Inbound call (PSTN leg #1, HD audio where supported)
+    T-&gt;&gt;M: Incoming call webhook (via Bot Flow Gateway)
+    M--&gt;&gt;T: TwiML &lt;Connect&gt;&lt;ConversationRelay url=&quot;wss://bot-flow&quot;&gt;
+    T-&gt;&gt;CR: Start relay session
+    CR-&gt;&gt;M: WebSocket &quot;setup&quot; (CallSid, From, custom params)
+    loop Every turn
+        C-&gt;&gt;CR: Caller speech
+        CR-&gt;&gt;M: &quot;prompt&quot; (final transcript text)
+        M-&gt;&gt;V: Text + context
+        V--&gt;&gt;M: Streamed tokens
+        M--&gt;&gt;CR: &quot;text&quot; tokens (streamed)
+        CR-&gt;&gt;C: TTS audio (11 Labs / Google / Amazon)
+        CR-)CI: Live transcript to operators
+        CI-)M: Webhook: sentiment / custom operator result
+    end
+    M-&gt;&gt;CR: &quot;end&quot; with handoffData (transfer to human)
+    T-&gt;&gt;C: Dial agent on the same call (no conference room)
+</pre></section>
+<section><h2>Topology: Before vs. After</h2><pre class="mermaid">flowchart LR
+    subgraph NOW[&quot;Current: 3+ media legs, 4 consoles&quot;]
+        direction LR
+        C1([Caller]) -- &quot;PSTN leg 1&quot; --&gt; T1[Twilio]
+        T1 -- &quot;leg 2: bridge into room&lt;br/&gt;(transcoded)&quot; --&gt; D1[Daily Room]
+        M1[Bot Flow Agent] -- &quot;leg 3: WebRTC&quot; --&gt; D1
+        M1 -- &quot;audio WS&quot; --&gt; V1[Vertex AI S2S]
+        T1 -. &quot;leg 4: transfer&quot; .-&gt; H1([Human])
+    end
+
+    subgraph NEXT[&quot;Target: 1 media leg, 1 console&quot;]
+        direction LR
+        C2([Caller]) -- &quot;PSTN leg 1 (HD)&quot; --&gt; T2[&quot;Twilio&lt;br/&gt;ConversationRelay&quot;]
+        T2 -- &quot;text WS&quot; --&gt; M2[Bot Flow Agent]
+        M2 -- &quot;text&quot; --&gt; V2[Vertex AI / any LLM]
+        T2 -- &quot;live transcript&quot; --&gt; CI2[Conversation Intelligence]
+        CI2 -- &quot;webhooks&quot; --&gt; M2
+        T2 -. &quot;same call, Dial&quot; .-&gt; H2([Human])
+    end
+
+    style D1 fill:#fde2e2,stroke:#d33
+    style T2 fill:#e2f5e9,stroke:#2a8
+</pre></section>
+</body></html>
